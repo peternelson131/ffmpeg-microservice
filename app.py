@@ -61,15 +61,17 @@ cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
 
 def extract_audio(input_path, output_path):
-    """Extract audio from video and save as MP3."""
+    """Extract audio from video and save as MP3 with proper metadata."""
     try:
         command = [
             'ffmpeg',
             '-i', input_path,
             '-vn',  # No video
             '-acodec', 'libmp3lame',  # MP3 codec
-            '-ab', '192k',  # Audio bitrate
+            '-q:a', '2',  # High quality MP3 (VBR)
             '-ar', '44100',  # Sample rate
+            '-ac', '2',  # Stereo
+            '-write_id3v2', '1',  # Write ID3v2 tags
             '-y',  # Overwrite output file
             output_path
         ]
@@ -410,7 +412,7 @@ def extract_video_only():
         # Clean up
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-@app.route('/download/<job_id>/<file_type>', methods=['GET'])
+@app.route('/download/<job_id>/<file_type>', methods=['GET', 'HEAD', 'OPTIONS'])
 def download_file(job_id, file_type):
     """
     Download extracted audio or video file.
@@ -419,6 +421,14 @@ def download_file(job_id, file_type):
         job_id: The job ID returned from /process
         file_type: Either 'audio' or 'video'
     """
+
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'ok'})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return response
 
     # Validate file type
     if file_type not in ['audio', 'video']:
@@ -443,13 +453,20 @@ def download_file(job_id, file_type):
     if not os.path.exists(file_path):
         return jsonify({'error': 'File not found'}), 404
 
-    # Return file
-    return send_file(
+    # Return file with CORS headers
+    response = send_file(
         file_path,
         mimetype=mimetype,
         as_attachment=False,  # Allow inline viewing
         download_name=filename
     )
+
+    # Add CORS headers for external services like Sync Labs
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
+    response.headers['Cache-Control'] = 'public, max-age=3600'
+
+    return response
 
 @app.errorhandler(413)
 def request_entity_too_large(error):
