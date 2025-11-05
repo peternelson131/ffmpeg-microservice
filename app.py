@@ -6,18 +6,59 @@ from flask import Flask, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 import shutil
 from pathlib import Path
+from datetime import datetime, timedelta
+import threading
+import time
 
 app = Flask(__name__)
 
 # Configuration
 MAX_CONTENT_LENGTH = 500 * 1024 * 1024  # 500MB max file size
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'webm', 'flv'}
+STORAGE_DIR = os.environ.get('STORAGE_DIR', '/tmp/ffmpeg-storage')
+BASE_URL = os.environ.get('BASE_URL', '')  # Set in Railway or leave empty for relative URLs
+FILE_EXPIRY_HOURS = 2  # Files are kept for 2 hours
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+
+# Create storage directory
+os.makedirs(STORAGE_DIR, exist_ok=True)
+
+# Store job metadata
+jobs_metadata = {}
 
 def allowed_file(filename):
     """Check if the file extension is allowed."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def cleanup_old_files():
+    """Remove files older than FILE_EXPIRY_HOURS."""
+    while True:
+        try:
+            current_time = datetime.now()
+            for job_id in list(jobs_metadata.keys()):
+                job_data = jobs_metadata[job_id]
+                created_at = job_data.get('created_at')
+
+                if created_at and (current_time - created_at) > timedelta(hours=FILE_EXPIRY_HOURS):
+                    # Remove files
+                    job_dir = os.path.join(STORAGE_DIR, job_id)
+                    if os.path.exists(job_dir):
+                        shutil.rmtree(job_dir, ignore_errors=True)
+
+                    # Remove from metadata
+                    del jobs_metadata[job_id]
+                    print(f"Cleaned up expired job: {job_id}")
+
+            # Sleep for 30 minutes before next cleanup
+            time.sleep(1800)
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+            time.sleep(1800)
+
+# Start cleanup thread
+cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
+cleanup_thread.start()
 
 def extract_audio(input_path, output_path):
     """Extract audio from video and save as MP3."""
@@ -85,10 +126,15 @@ def health_check():
         result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
         ffmpeg_available = result.returncode == 0
 
+        # Count active jobs
+        active_jobs = len(jobs_metadata)
+
         return jsonify({
             'status': 'healthy',
             'ffmpeg_available': ffmpeg_available,
-            'version': '1.0.0'
+            'version': '2.0.0',
+            'active_jobs': active_jobs,
+            'file_expiry_hours': FILE_EXPIRY_HOURS
         }), 200
     except Exception as e:
         return jsonify({
@@ -100,14 +146,14 @@ def health_check():
 def process_video():
     """
     Process video: extract audio as MP3 and video without audio as MP4.
+    Returns JSON with public URLs for the extracted files.
 
     Request:
         - multipart/form-data with 'video' file
-        - optional: 'output_format' (json|files) - default: json with URLs
 
     Response:
-        - JSON with base64 encoded files or temporary URLs
-        - Or direct file downloads (if output_format=files)
+        - JSON with public URLs for audio and video files
+        - Files are stored for 2 hours then automatically deleted
     """
 
     # Check if video file is present
@@ -134,9 +180,13 @@ def process_video():
         input_path = os.path.join(temp_dir, f"input_{filename}")
         video_file.save(input_path)
 
-        # Define output paths
-        audio_output = os.path.join(temp_dir, f"{job_id}_audio.mp3")
-        video_output = os.path.join(temp_dir, f"{job_id}_video.mp4")
+        # Create persistent storage directory for this job
+        job_dir = os.path.join(STORAGE_DIR, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+
+        # Define output paths in persistent storage
+        audio_output = os.path.join(job_dir, "audio.mp3")
+        video_output = os.path.join(job_dir, "video.mp4")
 
         # Extract audio
         extract_audio(input_path, audio_output)
@@ -154,32 +204,49 @@ def process_video():
         audio_size = os.path.getsize(audio_output)
         video_size = os.path.getsize(video_output)
 
-        # For n8n, we'll return the files as a response
-        # n8n can handle file downloads from the response
+        # Store job metadata
+        jobs_metadata[job_id] = {
+            'created_at': datetime.now(),
+            'audio_size': audio_size,
+            'video_size': video_size,
+            'original_filename': filename
+        }
+
+        # Build URLs
+        base = BASE_URL if BASE_URL else request.host_url.rstrip('/')
+        audio_url = f"{base}/download/{job_id}/audio"
+        video_url = f"{base}/download/{job_id}/video"
 
         return jsonify({
             'success': True,
             'job_id': job_id,
             'audio': {
-                'filename': f"{job_id}_audio.mp3",
-                'size': audio_size,
-                'download_url': f"/download/{job_id}/audio"
+                'url': audio_url,
+                'filename': 'audio.mp3',
+                'size': audio_size
             },
             'video': {
-                'filename': f"{job_id}_video.mp4",
-                'size': video_size,
-                'download_url': f"/download/{job_id}/video"
+                'url': video_url,
+                'filename': 'video.mp4',
+                'size': video_size
             },
-            'message': 'Video processed successfully. Use download URLs to retrieve files.'
+            'expires_in_hours': FILE_EXPIRY_HOURS,
+            'message': 'Video processed successfully. Files will be available for 2 hours.'
         }), 200
 
     except Exception as e:
         # Clean up on error
         shutil.rmtree(temp_dir, ignore_errors=True)
+        job_dir = os.path.join(STORAGE_DIR, job_id)
+        if os.path.exists(job_dir):
+            shutil.rmtree(job_dir, ignore_errors=True)
         return jsonify({
             'error': 'Processing failed',
             'details': str(e)
         }), 500
+    finally:
+        # Clean up temp directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 @app.route('/process-inline', methods=['POST'])
 def process_video_inline():
@@ -342,6 +409,47 @@ def extract_video_only():
     finally:
         # Clean up
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+@app.route('/download/<job_id>/<file_type>', methods=['GET'])
+def download_file(job_id, file_type):
+    """
+    Download extracted audio or video file.
+
+    URL Parameters:
+        job_id: The job ID returned from /process
+        file_type: Either 'audio' or 'video'
+    """
+
+    # Validate file type
+    if file_type not in ['audio', 'video']:
+        return jsonify({'error': 'Invalid file type. Use "audio" or "video"'}), 400
+
+    # Check if job exists
+    if job_id not in jobs_metadata:
+        return jsonify({'error': 'Job not found or expired'}), 404
+
+    # Build file path
+    job_dir = os.path.join(STORAGE_DIR, job_id)
+    if file_type == 'audio':
+        file_path = os.path.join(job_dir, 'audio.mp3')
+        mimetype = 'audio/mpeg'
+        filename = f"{job_id}_audio.mp3"
+    else:
+        file_path = os.path.join(job_dir, 'video.mp4')
+        mimetype = 'video/mp4'
+        filename = f"{job_id}_video.mp4"
+
+    # Check if file exists
+    if not os.path.exists(file_path):
+        return jsonify({'error': 'File not found'}), 404
+
+    # Return file
+    return send_file(
+        file_path,
+        mimetype=mimetype,
+        as_attachment=False,  # Allow inline viewing
+        download_name=filename
+    )
 
 @app.errorhandler(413)
 def request_entity_too_large(error):
