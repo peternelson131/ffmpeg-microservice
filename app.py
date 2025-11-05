@@ -214,8 +214,13 @@ def process_video():
             'original_filename': filename
         }
 
-        # Build URLs
-        base = BASE_URL if BASE_URL else request.host_url.rstrip('/')
+        # Build URLs - force HTTPS for Railway
+        if BASE_URL:
+            base = BASE_URL
+        else:
+            # Use request.host but force HTTPS (Railway is behind a reverse proxy)
+            base = f"https://{request.host}"
+
         audio_url = f"{base}/download/{job_id}/audio"
         video_url = f"{base}/download/{job_id}/video"
 
